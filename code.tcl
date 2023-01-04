@@ -3,12 +3,12 @@ package require term::ansi::ctrl::unix
 package require term::ansi::code::attr
 
 set myName aecepoglu
-eval [exec gh pr view --json headRepository,headRepositoryOwner,number --template "
-	set repo {{.headRepositoryOwner.login}}/{{.headRepository.name}}
-	set pr {{.number}}"]
+# eval [exec gh pr view --json headRepository,headRepositoryOwner,number --template "
+# 	set repo {{.headRepositoryOwner.login}}/{{.headRepository.name}}
+# 	set pr {{.number}}"]
 
 set repo aecepoglu/gh-prr
-set pr 13
+set pr 1
 
 proc group-by {f xs} {
 		set y [dict create]
