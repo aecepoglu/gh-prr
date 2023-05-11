@@ -21,20 +21,32 @@
      (with ([h . t] k)
            (F ((if (number? h) list-ref hash-ref) o h)
               t)))))
-
+[["ali" . "veli"] ["bulum" . "durum"]]
 (module ReplyTpl
  (import :std/event)
+ (import :std/misc/string) ; TODO string-whitespace? only
  (def start "### enter your message below this line ###")
  (def mid   "### enter your message above this line ###")
  (def (end? x) (match (string-split x #\space)
-                      (["###" "thread" x "###"] x)
+                      (["###" "r,p,c" r p c "###"] [r p c])
                       (_ #f)))
                  
- (def (make id lines)
+ (def (make repo pr thread lines)
   (append
    [start "" mid]
    lines
-   (list (string-append "### thread " id " ###"))))
+   [(string-join ["###" "r,p,c" repo pr thread "###"] " ")]))
+ (def (trim-start-ws l)
+   (cond ((null? l))
+         ((string-whitespace? (car l)) (trim-start-ws (cdr l)))
+         (else                         l)))
+ (def trim-empty-lines (chain <>
+                        trim-start-ws reverse
+                        trim-start-ws reverse))
+ (def (cleanup lines)
+   (trim-empty-lines
+    (filter (lambda (x) (not (string-prefix? "# " x)))
+            lines)))
  (def (read port)
    (let R ((a []) (ok #f))
       (let* ((e (sync port 0.5))
@@ -45,7 +57,7 @@
          ((equal? mid x)   (R a #f))
          (else             (let (y (end? x))
                              (cons y (reverse a))
-                             (R (if ok (cons x a) a) ok)))))))
+                             (R (if (cons x a) a) ok)))))))
  (export make read))
 
 (module hash-xtra
@@ -64,8 +76,8 @@
  (def gql:pr "query Foo($owner: String!, $repo: String!, $pr: Int!, $endCursor:String) {
    repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
-         number, author {login}, bodyText, baseRefName, headRefName, title, url
-         participants(first:100) { nodes { login } }
+         repository {nameWithOwner}, baseRefName, headRefName,
+         number, author {login}, bodyText, title, url
          reviewDecision
          reviewThreads(first: 100, after:$endCursor) {
             nodes {
@@ -193,12 +205,12 @@
    (kak:eval (string-append
               "edit -existing " file " " (if line line ""))))
 
- (def (kak:edit-fifo lines str/PR (client "client0") (session "wss"))
+ (def (kak:edit-fifo lines bufname (client "client0") (session "wss"))
   (let (fifo "/tmp/gh-prr.replies.fifo")
    (unless (file-exists? fifo)
            (create-fifo fifo))
    (kak:eval (string-append
-              "edit -fifo " fifo " *pr-" str/PR "-replies*"))
+              "edit -fifo " fifo " " bufname))
    (write-file-lines fifo lines))))
 
 (import :std/misc/process
@@ -321,11 +333,10 @@
                    (car resp))))
     (@ comment 'commit 'oid)))
     
-
 (def (handle-input t repo str/PR pr)
   ;(hash-keys (last (@ (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0) 'comments 'nodes)))
   (case (tui:read-key)
-     ((#\q) [#f 0]) ; I can move onto another PR?
+     ((#\q) [#f 0])
      ((#\n) [#t 1])
      ((#\p) [#t -1])
      ((#\G) (let (err (git:state-ok? (@ pr 'headRefName)
@@ -341,9 +352,8 @@
             tui:say-lines)
           [#t 0])
    ((#\r) (tui:sayln "Please send data into /tmp/gh-prr.in.fifo")
-          (let (lines (apply append
-                       (map thread->reply-tpl threads)))
-           (kak:edit-fifo threads str/PR))
+          (let (lines (pr->reply-tpl pr))
+           (kak:edit-fifo lines (string-append "*pr-" str/PR "-replies*")))
           [#t 0])
    ((#\z) (let (resp (gh:resolve-thread (hash-ref t 'id)))
             (tui:sayln (string-append
@@ -372,14 +382,12 @@
       ((> loops 50)     #t)
       ((not (port? e)) (R i i (1+ loops)))
       ((equal? e fifo)
-       (let (x (ReplyTpl#read fifo)) ; TODO return a record instead
+       (let (x (ReplyTpl#read fifo))
         (unless (null? x)
-          (tui:sayln "\n\rSending reply to " (car x))
-          (gh:reply
-           repo ; TODO these should be read from the incoming reply data
-           str/PR
-           (car x)
-           (string-join (cdr x) "\r\n"))))
+          (with ([[r p c] . lines] x)
+             (tui:sayln "\n\rSending reply to repo:" repo " pr:" pr " comment:" comment)
+             (gh:reply r p c
+              (string-join lines "\r\n")))))
        (R i i (1+ loops)))
       ((equal? e stdin) (with ([fin? di] (handle-input (vector-ref v i)
                                                        repo str/PR pr))
@@ -557,15 +565,21 @@
 
 
 (import (prefix-in ReplyTpl ReplyTpl#))
-     
-(def (thread->reply-tpl thread)
-  (ReplyTpl#write
-   (number->string (hash-ref (car thread) 'id))
-   (map comment->string thread)))
+
+(def (pr->reply-tpl pr)
+  (let ((prnum (number->string (@ pr 'number)))
+        (repo (@ pr 'repository 'nameWithOwner))
+        (threads (@ pr 'reviewThreads 'nodes)))
+   (apply append
+     (map (lambda (thread)
+           (ReplyTpl#make repo prnum
+                 (number->string (@ thread 'comments 'nodes 0 'databaseId))
+                 (thread->strings thread)))
+        threads))))
 
 (def (wip)
   ;(load "code.scm")
-  (def pr (gh:pr-info "1"))
+  (def pr (@ (gh:pr-info "1") 'repository 'pullRequest))
   (displayln (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0 'id))
   (gh:resolve-thread
    (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0 'id)))
@@ -573,3 +587,4 @@
 ; TODO replies should be trimmed before being sent
 ; TODO open a PR
 ; TODO syntax highlighting for kakoune files
+; participants(first:100) { nodes { login}} may be useful in a PR to retrieve info about all participants so I can assign them unique colours
