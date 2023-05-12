@@ -1,9 +1,22 @@
 #!/bin/env gxi
 
-(defstruct reply (id msg))
+(import :std/os/fd 
+        :std/event
+        :std/misc/process
+        :std/format
+        :std/sugar
+        :std/getopt
+        :std/misc/ports
+        :std/srfi/19 ; dates
+        :tui
+        "git"
+        "kakoune"
+        (prefix-in "reply-tpl" ReplyTpl#))
 
-(import :std/os/fd)
-(import :std/event)
+(def (TODO . args) #!void)
+
+(def (env-or k v)
+  (try (getenv k) (catch _ v)))
 
 (def (limit lower x upper)
   (min upper (max lower x)))
@@ -15,57 +28,12 @@
         (floor (/ n 10)))
      (list->string a))))
 
-(def (@ o0 . k0)
+(def (@ o0 . k0) ; TODO change to a macro
   (let F ((o o0) (k k0))
    (if (null? k) o
      (with ([h . t] k)
            (F ((if (number? h) list-ref hash-ref) o h)
               t)))))
-[["ali" . "veli"] ["bulum" . "durum"]]
-(module ReplyTpl
- (import :std/event)
- (import :std/misc/string) ; TODO string-whitespace? only
- (def start "### enter your message below this line ###")
- (def mid   "### enter your message above this line ###")
- (def (end? x) (match (string-split x #\space)
-                      (["###" "r,p,c" r p c "###"] [r p c])
-                      (_ #f)))
-                 
- (def (make repo pr thread lines)
-  (append
-   [start "" mid]
-   lines
-   [(string-join ["###" "r,p,c" repo pr thread "###"] " ")]))
- (def (trim-start-ws l)
-   (cond ((null? l))
-         ((string-whitespace? (car l)) (trim-start-ws (cdr l)))
-         (else                         l)))
- (def trim-empty-lines (chain <>
-                        trim-start-ws reverse
-                        trim-start-ws reverse))
- (def (cleanup lines)
-   (trim-empty-lines
-    (filter (lambda (x) (not (string-prefix? "# " x)))
-            lines)))
- (def (read port)
-   (let R ((a []) (ok #f))
-      (let* ((e (sync port 0.5))
-             (x (if e (read-line e) #!eof)))
-        (cond
-         ((eof-object? x)  [])
-         ((equal? start x) (R [] #t))
-         ((equal? mid x)   (R a #f))
-         (else             (let (y (end? x))
-                             (cons y (reverse a))
-                             (R (if (cons x a) a) ok)))))))
- (export make read))
-
-(module hash-xtra
- (export #t)
- (def (hash-refs t k)
-  (if (null? k)
-   t
-   (hash-refs (hash-ref t (car k)) (cdr k)))))
 
 (module gh
  (import
@@ -109,12 +77,11 @@
 ;              "gh-config-dir")])
  (def gh-env #f)
  (def (gh-cli args)
-  ;(displayln "gh" args)
   (run-process ["gh" "--jq" "." . args] coprocess: read-json environment: gh-env))
 
  (def (gql args)
    (hash-ref
-    (gh-cli ["api" "graphql" "--paginate" "--cache" "5m" . args])
+    (gh-cli ["api" "graphql" "--paginate" "--cache" "1m" . args])
     'data))
 
  (def (gh:pr-list repo json-fields: (fields ["id"]))
@@ -123,15 +90,6 @@
            "--json" (string-join fields ",")
            "--limit" "100"]))
 
- (def (gh:pr-comments repo pr)
-  (gh-cli ["api" "-H" "Accept: application/vnd.github+json"
-                      (string-append "/repos/" repo "/pulls/" pr "/comments")]))
-
- (def (gh:pr-view repo pr json-fields: (fields ["id"]))
-  (gh-cli ["pr" "view"
-           pr
-           "--repo" repo
-           "--json" (string-join fields ",")]))
  (def (gh:reply repo pr parent reply)
    (gh-cli ["api" "-H" "Accept: application/vnd.github+json" "--method" "POST"
             (string-append "/repos/" repo "/pulls/" pr "/comments/"
@@ -151,87 +109,12 @@
          "-F" (string-append "pr=" pr)
          "-f" (string-append "query=" gql:pr)])))
 
-(module git
-        (import :std/misc/process 
-         :std/misc/ports :std/sugar)
- (export #t)
- ;; returns a hexadruple describing git status we're in
- ;; car has error
- ;; cdr is a pentadruple describing ... stuff :/
- (def (git:meta)
-   (try
-    (cons #f
-      (run-process ["git" "rev-parse"
-                    "HEAD" ; commit id
-                    "--is-inside-work-tree" ;
-                    "--show-prefix" ; cwd relative to git root
-                    "--show-toplevel" ; abs path to git root
-                    "--abbrev-ref" "HEAD"] ; branch name
-        coprocess: read-all-as-lines))
-    (catch (err)
-           (displayln err)
-           (cons err (make-list 5 "")))))
- (def (git:state-ok? branch commit)
-   (with
-     ([ok? cmt is-in _ _ brn] (git:meta))
-     (if (and ok? ; return richer errors
-          (equal? is-in "true")
-          (or (equal? cmt commit)
-              (equal? brn branch)))
-       #f
-       (string-append
-        (if ok? "OK" "NOTOK")
-        ", branch=" branch " vs " brn
-        ", commit=" commit " vs " cmt
-        ", is-in=" is-in
-        "\r\n"))))
- (def (git:checkout commit)
-   (run-process ["git" "checkout" commit] coprocess: read-all-as-lines check-status: #f)))
+(import gh)
 
-(module kakoune
- (import :gerbil/gambit/os
-         :std/misc/ports
-         :std/misc/process)
- (def (kak:p txt)
-   (lambda (p)
-    (display txt p)
-    (close-output-port p)))
 
- (def (kak:eval txt (client "client0") (session "wss"))
-   (run-process ["kak" "-p" session]
-       coprocess: (kak:p (string-append "eval -client " client " %{ " txt "}"))))
-
- (def (kak:edit file (line #f) (client "client0") (session "wss"))
-   (kak:eval (string-append
-              "edit -existing " file " " (if line line ""))))
-
- (def (kak:edit-fifo lines bufname (client "client0") (session "wss"))
-  (let (fifo "/tmp/gh-prr.replies.fifo")
-   (unless (file-exists? fifo)
-           (create-fifo fifo))
-   (kak:eval (string-append
-              "edit -fifo " fifo " " bufname))
-   (write-file-lines fifo lines))))
-
-(import :std/misc/process
-        :std/text/json
-        :std/srfi/19 ; dates
-        :std/format
-        :std/sugar
-        :std/getopt
-        :std/misc/ports)
-(import :tui
-        hash-xtra
-        gh
-        git
-        kakoune)
-
+(def BROWSER (env-or "BROWSER" "firefox"))
 (def my-name "aecepoglu")
-(def BROWSER "firefox")
 (def (me? x) (equal? x my-name))
-
-(def (repl-stdin-fix)
- (run-process ["stty" "sane"] stdin-redirection: #f))
 
 (def (run-length-encode eq? xs)
  (let aux ((a '()) (x xs))
@@ -247,7 +130,7 @@
 (def (listreview->string r prefix: (prefix "  "))
    (string-append
       prefix
-      (hash-refs r ['author 'login])
+      (@ r 'author 'login)
       " "
       (hash-ref r 'state)
       " at "
@@ -264,7 +147,7 @@
    (string-join
     (map counted
      (run-length-encode string=?
-      (map (cut hash-refs <> ['author 'login])
+      (map (cut @ <> 'author 'login)
        r)))
     " ")))
 
@@ -275,7 +158,7 @@
     " "
     .title
     " ("
-    (hash-refs t ['author 'login])
+    (@ t 'author 'login)
     " > "
     (string-join
      (map (cut hash-ref <> 'login)
@@ -292,7 +175,7 @@
   (= 0 (length (hash-ref listed-pr 'reviews))))
 
 (def (is-mine? pr)
-  (me? (hash-refs pr ['author 'login])))
+  (me? (@ pr 'author 'login)))
 
 (def (requests-me? listed-pr)
   (ormap
@@ -332,13 +215,26 @@
                    (car comments)
                    (car resp))))
     (@ comment 'commit 'oid)))
-    
+
 (def (handle-input t repo str/PR pr)
   ;(hash-keys (last (@ (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0) 'comments 'nodes)))
   (case (tui:read-key)
      ((#\q) [#f 0])
+     ((#\?) (tui:say-lines ["q : Quit"
+                            "n|p : Next|Prev"
+                            "g : Goto line in editor"
+                            "G : check Git sanity"
+                            "c : Checkout latest commit someone else commented on"
+                            "r : edit Replies in editor"
+                            "i : Inline reply (a single line reply right here)"
+                            "z : reZolve current conversation (without a comment)"
+                            "w : open comment in Web browser"])
+            [#t 1])
      ((#\n) [#t 1])
      ((#\p) [#t -1])
+     ((#\g) (vscode:edit (hash-ref t 'path)
+                   (number->string (hash-ref t 'line)))
+            [#t 0])
      ((#\G) (let (err (git:state-ok? (@ pr 'headRefName)
                                      (thread->commit t)))
              (if err
@@ -346,25 +242,23 @@
                           "(make sure you've stashed your changes and stuff)")
                (tui:sayln "ALL GOOD"))
              [#t 0]))
-   ((#\c) (chain t
-            thread->commit
-            git:checkout ; TODO test again
-            tui:say-lines)
-          [#t 0])
-   ((#\r) (tui:sayln "Please send data into /tmp/gh-prr.in.fifo")
-          (let (lines (pr->reply-tpl pr))
-           (kak:edit-fifo lines (string-append "*pr-" str/PR "-replies*")))
-          [#t 0])
-   ((#\z) (let (resp (gh:resolve-thread (hash-ref t 'id)))
-            (tui:sayln (string-append
-                        "Resolving thread is... "
-                        (if (@ resp 'resolveReviewThread 'thread 'isResolved) "OK." "FAIL!"))))
-          [#t 0])
-   ((#\w) (run-process [BROWSER (@ t 'comments 'nodes 0 'url)]) [#t 0])
-   ((#\i) (interactive:reply t repo str/PR) [#t 0])
-   ((#\g) (kak:edit (hash-ref (car t) 'path) (comment->line (car t)))
-          [#t 0])
-   (else  [#t 0])))
+     ((#\c) (chain t
+              thread->commit
+              git:checkout ; TODO test again
+              tui:say-lines)
+            [#t 0])
+     ((#\r) (tui:sayln "Please send data into /tmp/gh-prr.in.fifo")
+            (let (lines (pr->reply-tpl pr))
+             (kak:edit-lines lines (string-append "*pr-" str/PR "-replies*")))
+            [#t 0])
+     ((#\z) (let (resp (gh:resolve-thread (hash-ref t 'id)))
+              (tui:sayln (string-append
+                          "Resolving thread is... "
+                          (if (@ resp 'resolveReviewThread 'thread 'isResolved) "OK." "FAIL!"))))
+            [#t 0])
+     ((#\w) (run-process [BROWSER (@ t 'comments 'nodes 0 'url)]) [#t 0])
+     ((#\i) (interactive:reply t repo str/PR) [#t 0])
+     (else  [#t 0])))
 
 (def (review-threads-interactive pr repo str/PR fifo stdin)
  (let* ((v (list->vector (@ pr 'reviewThreads 'nodes)))
@@ -375,19 +269,19 @@
      (tui:say-lines (cons
                      "-----------------------------------------------"
                      (thread->strings (vector-ref v i)))))
-    (say (fmt bri) "thread " (number->string (1+ i)) "/" (number->string (1+ n)) (fmt) " "
-         (fmt ita) "(g G c n p i r z w):" (fmt))
+    (say (fmt bri) "\rthread " (number->string (1+ i)) "/" (number->string (1+ n)) (fmt) " "
+         (fmt ita) "(? for info):" (fmt))
     (let (e (sync fifo stdin))
      (cond ; TODO move di over here and call R at a single point
       ((> loops 50)     #t)
       ((not (port? e)) (R i i (1+ loops)))
       ((equal? e fifo)
-       (let (x (ReplyTpl#read fifo))
-        (unless (null? x)
-          (with ([[r p c] . lines] x)
-             (tui:sayln "\n\rSending reply to repo:" repo " pr:" pr " comment:" comment)
-             (gh:reply r p c
-              (string-join lines "\r\n")))))
+       (match (ReplyTpl#read fifo)
+         ([]             #t)
+         ([[r p c]]      #t)
+         ([[r p c] . lines]
+          (gh:reply r p c
+           (string-join lines "\n\r"))))
        (R i i (1+ loops)))
       ((equal? e stdin) (with ([fin? di] (handle-input (vector-ref v i)
                                                        repo str/PR pr))
@@ -396,33 +290,10 @@
   (tui:restore! tty-state)
   (displayln "Bye!")))
 
-(def (comments->threads comments)
-  (let ((tbl (make-hash-table))
-        (pred (cut hash-key? <> 'in_reply_to_id)))
-   (for-each (lambda (x) (hash-put! tbl (hash-ref x 'id) (cons x [])))
-            (filter (? (not pred)) comments))
-   (for-each (lambda (x) (hash-update! tbl (hash-ref x 'in_reply_to_id) (cut cons x <>) x))
-            (filter (? pred) comments))
-   ; TODO did I add them in the right order?
-   (map reverse (hash-values tbl))))
-
-(def (comment->line comment)
-  ; start_line ; original_start_line
-  ; line ; original_line
-  (let-hash comment
-    (if (void? .line)
-        "??"
-        (number->string .line))))
-
-(def (comment->string comment) ; TODO remove if nobody refers to this
+(def (comment->string comment)
   (let-hash comment
     (string-append
-     (hash-refs comment ['user 'login]) " (" (humanised .created_at) "): "
-     (reformat-body .body))))
-(def (comment->string_v2 comment)
-  (let-hash comment
-    (string-append
-     (hash-refs comment ['author 'login]) " (" (humanised (if (void? .lastEditedAt) .createdAt .lastEditedAt)) "): "
+     (@ comment 'author 'login) " (" (humanised (if (void? .lastEditedAt) .createdAt .lastEditedAt)) "): "
      (reformat-body .body))))
 
 (def (thread->strings thread)
@@ -430,21 +301,27 @@
     (append
      ; TODO only line comments have a .line
      [(format "• (~a) ~a:~d" .subjectType .path .line)]
-     (map (cut string-append "  " <>) (map comment->string_v2 (hash-ref .comments 'nodes)))
+     (map (cut string-append "  " <>) (map comment->string (hash-ref .comments 'nodes)))
      (if .isResolved ["======== RESOLVED ========"] []))))
+
+(def (pr->reply-tpl pr)
+  (let ((prnum (number->string (@ pr 'number)))
+        (repo (@ pr 'repository 'nameWithOwner))
+        (threads (@ pr 'reviewThreads 'nodes)))
+   (apply append
+     (map (lambda (thread)
+           (ReplyTpl#make repo prnum
+                 (number->string (@ thread 'comments 'nodes 0 'databaseId))
+                 (thread->strings thread)))
+        threads))))
 
 (def (interactive:reply thread repo str/PR)
   (tui:say-lines ["" "Please enter a line of comment below."])
   (say "Comment (no backspaces): " (fmt ita))
   (let (msg (tui:read-line-echoing))
     (say (fmt))
-    (send-reply repo str/PR (hash-ref (car thread) 'databaseId) [msg]))) ; TODO test. Use gql instead
+    (gh:reply "aecepoglu/gh-prr" "2" "1191546052" msg))) ; TODO test. Use gql instead
     
-(def (send-reply repo str/PR parent msg)
-  (say "... sending reply ...")
-  (gh:reply repo str/PR parent (string-join msg "\n\r"))
-  (tui:sayln " sent."))
-
 (def opt-parser
   (getopt
    (command 'list
@@ -466,9 +343,9 @@
   (let (pr (gh:pr-info str/PR))
    (let-hash (@ pr 'repository 'pullRequest)
     (tui:sayln (number->string .number) " " (fmt bri) (hash-ref .author 'login) " "(fmt ita) .title (fmt)" " (if (void? .reviewDecision) "-" .reviewDecision)
-               "\r\n\r\n" .bodyText "\r\n\r\n"
+               "\n\r\n\r" .bodyText "\n\r\n\r"
                (fmt und) .url (fmt))
-    (tui:sayln "\r\n-------------- Comments ------------------")
+    (tui:sayln "\n\r-------------- Comments ------------------")
     (for-each (lambda (x)
                 (thread:display-summary (@ x 'comments 'nodes))
                 (tui:sayln "---------------"))
@@ -498,7 +375,7 @@
   (let* (pr (gh:pr-info prNo)) ; TODO repo
    (with-input-fifo "/tmp/gh-prr.in.fifo"
      (cut review-threads-interactive
-          (@ pr 'repository 'pullRequest) repo pr
+          (@ pr 'repository 'pullRequest) repo prNo
           <> (fdopen 0 'in 'pipe)))))
 
 (def (main . args)
@@ -529,20 +406,20 @@
                    
 (def (thread:display-summary comments)
   (with ([a b c] (thread->pivots comments))
-    (tui:sayln (comment->string_v2 a))
+    (tui:sayln (comment->string a))
     (when (> b 0)
      (tui:sayln (fmt dim ita) "(" (number->string b) " more hidden)" (fmt)))
     (when c
-     (tui:sayln (comment->string_v2 c)))))
+     (tui:sayln (comment->string c)))))
 
 (def (thread-needs-attn? thread)
   (not (hash-ref thread 'isResolved)))
 
 (def (repl-stuff)
  (repl-stdin-fix)
- (def comments (gh:pr-comments "aecepoglu/gh-prr" "1"))
+ (def comments (gh:pr-comments "aecepoglu/gh-prr" "2"))
  (def threads (comments->threads comments))
- (kak:edit-replies threads "1")
+ (kak:edit-replies threads "2")
  (def pr (gh:pr-view "senchabot-dev/monorepo" "85"
                      json-fields: ["number" "baseRefName" "headRefName" "title"
                                    "body" "author" "reviewDecision" "url"]))
@@ -564,27 +441,12 @@
     (close-port port)))
 
 
-(import (prefix-in ReplyTpl ReplyTpl#))
-
-(def (pr->reply-tpl pr)
-  (let ((prnum (number->string (@ pr 'number)))
-        (repo (@ pr 'repository 'nameWithOwner))
-        (threads (@ pr 'reviewThreads 'nodes)))
-   (apply append
-     (map (lambda (thread)
-           (ReplyTpl#make repo prnum
-                 (number->string (@ thread 'comments 'nodes 0 'databaseId))
-                 (thread->strings thread)))
-        threads))))
-
 (def (wip)
-  ;(load "code.scm")
-  (def pr (@ (gh:pr-info "1") 'repository 'pullRequest))
-  (displayln (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0 'id))
-  (gh:resolve-thread
-   (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0 'id)))
+ (load "code.scm")
+ (def pr (@ (gh:pr-info "2") 'repository 'pullRequest))
+ (run-process ["stty" "sane"] stdin-redirection: #f)
+ #t)
 ; TODO be able to read error from stderr
-; TODO replies should be trimmed before being sent
 ; TODO open a PR
 ; TODO syntax highlighting for kakoune files
 ; participants(first:100) { nodes { login}} may be useful in a PR to retrieve info about all participants so I can assign them unique colours
