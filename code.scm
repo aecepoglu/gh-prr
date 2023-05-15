@@ -10,7 +10,6 @@
         :std/srfi/19 ; dates
         :tui
         "git"
-        "kakoune"
         (prefix-in "reply-tpl" ReplyTpl#))
 
 (def (TODO . args) #!void)
@@ -85,14 +84,15 @@
     'data))
 
  (def (gh:pr-list repo json-fields: (fields ["id"]))
-  (gh-cli ["pr" "list"
-           "--repo" repo
-           "--json" (string-join fields ",")
-           "--limit" "100"]))
+  (gh-cli (append
+           ["pr" "list"]
+           (if repo ["--repo" repo] [])
+           ["--json" (string-join fields ",")
+            "--limit" "100"])))
 
  (def (gh:reply repo pr parent reply)
    (gh-cli ["api" "-H" "Accept: application/vnd.github+json" "--method" "POST"
-            (string-append "/repos/" repo "/pulls/" pr "/comments/"
+            (string-append "/repos/" (or repo "{owner}/{repo}") "/pulls/" pr "/comments/"
                            ((if (number? parent) number->string identity) parent)
                            "/replies")
             "-f" (string-append "body=" reply)]))
@@ -108,13 +108,22 @@
          "-F" (string-append "repo=" repo)
          "-F" (string-append "pr=" pr)
          "-f" (string-append "query=" gql:pr)])))
-
 (import gh)
 
+(defvalues (BROWSER USERNAME EDITOR)
+  (let* ((dat (with-input-from-file "config.scm" read-all))
+         (plist (eval (car dat)))
+         (tbl   (plist->hash-table plist)))
+   (values (hash-ref tbl 'browser "firefox")
+           (hash-ref tbl 'username)
+           (hash-ref tbl 'editor))))
+(import "./editor/kakoune" "./editor/vscode")
+(defvalues (editor:edit editor:edit-lines)
+  (case EDITOR
+   ((kakoune) (values kak:edit kak:edit-lines))
+   ((vscode)  (values vscode:edit vscode:edit-lines))))
 
-(def BROWSER (env-or "BROWSER" "firefox"))
-(def my-name "aecepoglu")
-(def (me? x) (equal? x my-name))
+(def (me? x) (equal? x USERNAME))
 
 (def (run-length-encode eq? xs)
  (let aux ((a '()) (x xs))
@@ -232,7 +241,7 @@
             [#t 1])
      ((#\n) [#t 1])
      ((#\p) [#t -1])
-     ((#\g) (vscode:edit (hash-ref t 'path)
+     ((#\g) (editor:edit (hash-ref t 'path)
                    (number->string (hash-ref t 'line)))
             [#t 0])
      ((#\G) (let (err (git:state-ok? (@ pr 'headRefName)
@@ -249,7 +258,7 @@
             [#t 0])
      ((#\r) (tui:sayln "Please send data into /tmp/gh-prr.in.fifo")
             (let (lines (pr->reply-tpl pr))
-             (kak:edit-lines lines (string-append "*pr-" str/PR "-replies*")))
+             (editor:edit-lines lines (string-append "*pr-" str/PR "-replies*")))
             [#t 0])
      ((#\z) (let (resp (gh:resolve-thread (hash-ref t 'id)))
               (tui:sayln (string-append
@@ -322,23 +331,6 @@
     (say (fmt))
     (gh:reply "aecepoglu/gh-prr" "2" "1191546052" msg))) ; TODO test. Use gql instead
     
-(def opt-parser
-  (getopt
-   (command 'list
-     help: "lists PRs")
-   (command 'comments
-     help: "list comments in PR"
-     (argument 'pr))
-   (command 'review
-     help: "review comments in PR"
-     (argument 'pr))
-   (command 'sum
-     help: "summarise PR"
-     (argument 'pr))
-   (command 'wip
-     help: "test current feature in development")
-   (option 'repo "-r" help: "repo org/name" default: "aecepoglu/gh-prr")))
-
 (def (op:summarise repo str/PR)
   (let (pr (gh:pr-info str/PR))
    (let-hash (@ pr 'repository 'pullRequest)
@@ -378,21 +370,6 @@
           (@ pr 'repository 'pullRequest) repo prNo
           <> (fdopen 0 'in 'pipe)))))
 
-(def (main . args)
- (try
-  (let-values (((cmd opt) (getopt-parse opt-parser args)))
-    (let-hash opt
-      (case cmd
-          ((list)     (op:list-prs .repo))
-          ((comments) (op:list-comments .repo .pr))
-          ((review)   (op:review-comments .repo .pr))
-          ((sum)      (op:summarise .repo .pr))
-          ((wip)      (wip))))
-    #t)
-  (catch (getopt-error? exn)
-   (getopt-display-help exn "gh-prr" (current-error-port))
-   (exit 1))))
-
 (def (comment=? a b)
   (equal? (hash-ref a 'databaseId)
           (hash-ref b 'databaseId)))
@@ -415,17 +392,6 @@
 (def (thread-needs-attn? thread)
   (not (hash-ref thread 'isResolved)))
 
-(def (repl-stuff)
- (repl-stdin-fix)
- (def comments (gh:pr-comments "aecepoglu/gh-prr" "2"))
- (def threads (comments->threads comments))
- (kak:edit-replies threads "2")
- (def pr (gh:pr-view "senchabot-dev/monorepo" "85"
-                     json-fields: ["number" "baseRefName" "headRefName" "title"
-                                   "body" "author" "reviewDecision" "url"]))
- (hash-keys (car comments))
- #t)
-
 (def (try-create-fifo path)
  (unless (file-exists? path) (create-fifo path))
  path) ; TODO very naive
@@ -440,12 +406,55 @@
     (close-port lock)
     (close-port port)))
 
-
 (def (wip)
  (load "code.scm")
  (def pr (@ (gh:pr-info "2") 'repository 'pullRequest))
  (run-process ["stty" "sane"] stdin-redirection: #f)
  #t)
+
+(def opt-parser
+  (getopt
+   (command 'list
+     help: "lists PRs")
+   (command 'comments
+     help: "list comments in PR"
+     (argument 'pr))
+   (command 'review
+     help: "review comments in PR"
+     (argument 'pr))
+   (command 'sum
+     help: "summarise PR"
+     (argument 'pr))
+   (command 'wip
+     help: "test current feature in development")
+   (option 'repo "-r" help: "repo org/name" default: #f)))
+
+(def (main . args)
+ (try
+  (let-values (((cmd opt) (getopt-parse opt-parser args)))
+    (let-hash opt
+      (case cmd
+          ((list)     (op:list-prs .repo))
+          ((comments) (op:list-comments .repo .pr))
+          ((review)   (op:review-comments .repo .pr))
+          ((sum)      (op:summarise .repo .pr))
+          ((wip)      (wip))))
+    #t)
+  (catch (getopt-error? exn)
+   (getopt-display-help exn "gh-prr" (current-error-port))
+   (exit 1))))
+
+(def (repl-stuff)
+ (repl-stdin-fix)
+ (def comments (gh:pr-comments "aecepoglu/gh-prr" "2"))
+ (def threads (comments->threads comments))
+ (kak:edit-replies threads "2")
+ (def pr (gh:pr-view "senchabot-dev/monorepo" "85"
+                     json-fields: ["number" "baseRefName" "headRefName" "title"
+                                   "body" "author" "reviewDecision" "url"]))
+ (hash-keys (car comments))
+ #t)
+
 ; TODO be able to read error from stderr
 ; TODO open a PR
 ; TODO syntax highlighting for kakoune files
