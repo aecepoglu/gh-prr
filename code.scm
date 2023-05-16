@@ -111,7 +111,7 @@
 (import gh)
 
 (defvalues (BROWSER USERNAME EDITOR)
-  (let* ((dat (with-input-from-file "config.scm" read-all))
+  (let* ((dat (with-input-from-file "~/config.scm" read-all))
          (plist (eval (car dat)))
          (tbl   (plist->hash-table plist)))
    (values (hash-ref tbl 'browser "firefox")
@@ -225,77 +225,88 @@
                    (car resp))))
     (@ comment 'commit 'oid)))
 
-(def (handle-input t repo str/PR pr)
+(def (handle-input t repo prNo pr)
   ;(hash-keys (last (@ (@ pr 'repository 'pullRequest 'reviewThreads 'nodes 0) 'comments 'nodes)))
   (case (tui:read-key)
-     ((#\q) [#f 0])
-     ((#\?) (tui:say-lines ["q : Quit"
-                            "n|p : Next|Prev"
-                            "g : Goto line in editor"
-                            "G : check Git sanity"
-                            "c : Checkout latest commit someone else commented on"
-                            "r : edit Replies in editor"
-                            "i : Inline reply (a single line reply right here)"
-                            "z : reZolve current conversation (without a comment)"
-                            "w : open comment in Web browser"])
-            [#t 1])
-     ((#\n) [#t 1])
-     ((#\p) [#t -1])
+     ((#\q) 'quit)
+     ((#\?) (tui:say-lines
+             ["q : Quit"
+              "n|p : Next|Prev"
+              "g : Goto line in editor"
+              "G : check Git sanity"
+              "c : Checkout latest commit someone else commented on"
+              "r : edit Replies in editor"
+              "i : Inline reply (a single line reply right here)"
+              "z : reZolve current conversation (without a comment)"
+              "w : open comment in Web browser"])
+            'nothing)
+     ((#\n) 'next)
+     ((#\p) 'prev)
      ((#\g) (editor:edit (hash-ref t 'path)
                    (number->string (hash-ref t 'line)))
-            [#t 0])
+            'nothing)
      ((#\G) (let (err (git:state-ok? (@ pr 'headRefName)
                                      (thread->commit t)))
              (if err
                (tui:sayln err "press 'c' to checkout this branch & commit"
                           "(make sure you've stashed your changes and stuff)")
                (tui:sayln "ALL GOOD"))
-             [#t 0]))
+             'nothing))
      ((#\c) (chain t
               thread->commit
               git:checkout ; TODO test again
               tui:say-lines)
-            [#t 0])
+            'nothing)
      ((#\r) (tui:sayln "Please send data into /tmp/gh-prr.in.fifo")
             (let (lines (pr->reply-tpl pr))
-             (editor:edit-lines lines (string-append "*pr-" str/PR "-replies*")))
-            [#t 0])
+             (editor:edit-lines lines (string-append "*pr-" prNo "-replies*")))
+            'nothing)
      ((#\z) (let (resp (gh:resolve-thread (hash-ref t 'id)))
               (tui:sayln (string-append
                           "Resolving thread is... "
                           (if (@ resp 'resolveReviewThread 'thread 'isResolved) "OK." "FAIL!"))))
-            [#t 0])
-     ((#\w) (run-process [BROWSER (@ t 'comments 'nodes 0 'url)]) [#t 0])
-     ((#\i) (interactive:reply t repo str/PR) [#t 0])
-     (else  [#t 0])))
+            'nothing)
+     ((#\w) (run-process [BROWSER (@ t 'comments 'nodes 0 'url)]) 'nothing)
+     ((#\i) (interactive:reply t repo prNo) 'nothing)
+     (else  'rothing)))
 
-(def (review-threads-interactive pr repo str/PR fifo stdin)
- (let* ((v (list->vector (@ pr 'reviewThreads 'nodes)))
-        (n (1- (vector-length v)))
-        (tty-state (tui:init!)))
-  (let R ((j -1) (i 0) (loops 0))
-    (when (not (= i j))
-     (tui:say-lines (cons
-                     "-----------------------------------------------"
-                     (thread->strings (vector-ref v i)))))
-    (say (fmt bri) "\rthread " (number->string (1+ i)) "/" (number->string (1+ n)) (fmt) " "
-         (fmt ita) "(? for info):" (fmt))
-    (let (e (sync fifo stdin))
-     (cond ; TODO move di over here and call R at a single point
-      ((> loops 50)     #t)
-      ((not (port? e)) (R i i (1+ loops)))
-      ((equal? e fifo)
-       (match (ReplyTpl#read fifo)
-         ([]             #t)
-         ([[r p c]]      #t)
-         ([[r p c] . lines]
-          (gh:reply r p c
-           (string-join lines "\n\r"))))
-       (R i i (1+ loops)))
-      ((equal? e stdin) (with ([fin? di] (handle-input (vector-ref v i)
-                                                       repo str/PR pr))
-                          (when fin? (R i (limit 0 (+ i di) n) (1+ loops)))))
-      (else (R i i (1+ loops))))))
+(def (receive-reply-tpl port)
+  (match (ReplyTpl#read port)
+    ([]                #t)
+    ([[r p c]]         #t)
+    ([[r p c] . lines] (gh:reply r p c
+                        (string-join lines "\n\r")))))
+
+(def (event->update!/make repo pr prNo fifo stdin)
+  (lambda (e thread)
+   (cond
+    ((not (port? e))  'nothing)
+    ((equal? e fifo)  (receive-reply-tpl fifo) 'nothing)
+    ((equal? e stdin) (handle-input thread repo prNo pr))
+    (else             'nothing))))
+
+(def (review-threads-interactive repo pr prNo fifo stdin)
+ (let* ((v         (list->vector (@ pr 'reviewThreads 'nodes)))
+        (n         (1- (vector-length v)))
+        (tty-state (tui:init!))
+        (hndl!     (event->update!/make repo pr prNo fifo stdin)))
+  (if (> n 0)
+    (let R ((j -1) (i 0) (loops 0))
+     (when (not (= i j))
+      (tui:say-lines (cons
+                      "-----------------------------------------------"
+                      (thread->strings (vector-ref v i)))))
+     (say (fmt bri) "\rthread " (number->string (1+ i)) "/" (number->string (1+ n)) (fmt) " "
+          (fmt ita) "(? for info):" (fmt))
+     (case (hndl! (sync fifo stdin) (vector-ref v i))
+        ((nothing) (R i i                     (1+ loops)))
+        ((next)    (R i (min (+ i 1) n      ) (1+ loops)))
+        ((prev)    (R i (max 0       (- i 1)) (1+ loops)))
+        ((quit)    #t)
+        (else      #t)))
+      
+      
+    (tui:sayln "No threads to tend to."))
   (tui:restore! tty-state)
   (displayln "Bye!")))
 
@@ -324,15 +335,17 @@
                  (thread->strings thread)))
         threads))))
 
-(def (interactive:reply thread repo str/PR)
+(def (interactive:reply thread repo prNo)
   (tui:say-lines ["" "Please enter a line of comment below."])
   (say "Comment (no backspaces): " (fmt ita))
   (let (msg (tui:read-line-echoing))
-    (say (fmt))
-    (gh:reply "aecepoglu/gh-prr" "2" "1191546052" msg))) ; TODO test. Use gql instead
+    (when msg
+     (say (fmt) "(sending...")
+     (gh:reply "aecepoglu/gh-prr" "2" "1191546052" msg)
+     (say " sent.)\n\r"))))
     
-(def (op:summarise repo str/PR)
-  (let (pr (gh:pr-info str/PR))
+(def (op:summarise repo prNo)
+  (let (pr (gh:pr-info prNo))
    (let-hash (@ pr 'repository 'pullRequest)
     (tui:sayln (number->string .number) " " (fmt bri) (hash-ref .author 'login) " "(fmt ita) .title (fmt)" " (if (void? .reviewDecision) "-" .reviewDecision)
                "\n\r\n\r" .bodyText "\n\r\n\r"
@@ -367,7 +380,7 @@
   (let* (pr (gh:pr-info prNo)) ; TODO repo
    (with-input-fifo "/tmp/gh-prr.in.fifo"
      (cut review-threads-interactive
-          (@ pr 'repository 'pullRequest) repo prNo
+          repo (@ pr 'repository 'pullRequest) prNo
           <> (fdopen 0 'in 'pipe)))))
 
 (def (comment=? a b)
@@ -407,9 +420,13 @@
     (close-port port)))
 
 (def (wip)
- (load "code.scm")
- (def pr (@ (gh:pr-info "2") 'repository 'pullRequest))
- (run-process ["stty" "sane"] stdin-redirection: #f)
+ (let* ((bkp (tui:init!))
+        (txt (tui:read-line-echoing))
+        (_ (tui:restore! bkp)))
+   (displayln "\n\nYou entered: <" txt ">"))
+ ;(load "code.scm")
+ ;(def pr (@ (gh:pr-info "2") 'repository 'pullRequest))
+ ;(run-process ["stty" "sane"] stdin-redirection: #f)
  #t)
 
 (def opt-parser
