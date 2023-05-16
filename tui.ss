@@ -58,11 +58,6 @@
      (fdread stdin buf 0 1)
      (integer->char (bytes-ref buf 0)))))
 
-(def (quit? c)
-  (or (eof-object? c)
-      (char=? c #\q)
-      (char=? c #\newline)
-      (char=? c #\return)))
 
 (def (say . x)
   (let (b (string->bytes (apply string-append x)))
@@ -77,14 +72,21 @@
 (def (tui:say-lines lines)
   (for-each tui:sayln lines))
 
+;; return #f if exited via ctrl-c, a single line of text otherwise
 (def (tui:read-line-echoing)
   (let F ((acc []))
     (unless (null? acc)
       (say (list->string [(car acc)])))
     (let (c (tui:read-key))
-      (if (quit? c)
-        (list->string (reverse acc))
-        (F (cons c acc))))))
+      (case c
+        ((#\x3)        (when #t (say "(ctrl+c)")) #f)
+        ((#\newline
+          #\return)    (list->string (reverse acc)))
+        ((#\backspace
+          #\delete)    (say "\033[2D" "\033[0K")
+                       (F ((if (null? acc) identity cdr)
+                           acc)))
+        (else          (F (cons c acc)))))))
 
 ;; REFERENCES
 ;; Everything you ever wanted to know about terminals
